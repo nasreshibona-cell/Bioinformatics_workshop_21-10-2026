@@ -1,0 +1,410 @@
+# RNA-seq Training: Differential Gene Expression in *E. coli*
+
+**Wild type (ECWT) vs *slyA* mutant (ECMS)**
+
+A hands-on bioinformatics workshop that takes you through a complete RNA-seq analysis: from downloading raw sequencing reads to finding the genes that change between two bacterial strains. *Escherichia coli* has a small genome (about 4.6 Mb), so every step runs on an ordinary laptop.
+
+---
+
+## Contents
+
+- [The data](#the-data)
+- [What you will learn](#what-you-will-learn)
+- [Repository structure](#repository-structure)
+- [Setup](#setup)
+- [Quick start](#quick-start)
+- [Step 1 – Download the reads](#step-1--download-the-reads)
+- [Step 2 – Reference genome](#step-2--reference-genome)
+- [Step 3 – Quality control](#step-3--quality-control)
+- [Step 4 – Trimming](#step-4--trimming)
+- [Step 5 – Indexing, alignment and gene counting](#step-5--indexing-alignment-and-gene-counting)
+- [Step 6 – Merge the gene counts](#step-6--merge-the-gene-counts)
+- [Step 7 – Differential expression](#step-7--differential-expression)
+- [Questions](#questions)
+- [Troubleshooting](#troubleshooting)
+- [Data source](#data-source)
+
+---
+
+## The data
+
+The data are from NCBI GEO [GSE168963](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE168963) (ENA project [PRJNA714667](https://www.ebi.ac.uk/ena/browser/view/PRJNA714667)). There are 16 RNA-seq samples of *E. coli* BW25113 (runs `SRR13970433`–`SRR13970448`), each sequenced paired-end (2 FASTQ files per sample, 32 files):
+
+| Group | Strain | Samples |
+|---|---|---|
+| **ECWT** | Wild type | 8 |
+| **ECMS** | *slyA* mutant | 8 |
+
+<p align="center">
+  <img src="Document/images/table1_samples.png" width="650" alt="Table 1 from the dataset's publication">
+  <br><em>Table 1 from the dataset's publication: the 16 samples, their read counts and mapping rates.</em>
+</p>
+
+## What you will learn
+
+| Step | Task | Tool | Script | Output |
+|---|---|---|---|---|
+| 1 | Download reads | ENA, `wget` | [`download_fastq.sh`](scripts/download_fastq.sh) | 32 FASTQ files |
+| 2 | Reference genome | NCBI | [`get_reference.sh`](scripts/get_reference.sh) | Genome FASTA + GTF |
+| 3 | Quality control | FastQC, MultiQC | [`fast_qc.sh`](scripts/fast_qc.sh) | Quality reports |
+| 4 | Trimming | Trim Galore | [`trim.sh`](scripts/trim.sh) | Clean FASTQ files |
+| 5 | Indexing, alignment, gene counting | STAR | [`ecoli_gene_quantification.sh`](scripts/ecoli_gene_quantification.sh) | BAM files + gene counts |
+| 6 | Merge gene counts | R | [`merge_data.R`](scripts/merge_data.R) | One count table |
+| 7 | Differential expression | R, DESeq2 | [`DEG_ecoli.R`](scripts/DEG_ecoli.R) | Results table, volcano plot, heatmap, PCA |
+
+Steps 1–5 run in a Linux terminal (Ubuntu, or WSL on Windows). Steps 6–7 run in R or RStudio.
+
+---
+
+## Repository structure
+
+```text
+training/
+├── README.md            # this tutorial
+├── scripts/             # one script per step
+├── reference/           # E. coli genome (FASTA) and annotation (GTF)
+├── DEG/                 # pdata.csv (sample groups) + results of Steps 6–7
+├── Document/            # practical document, paper, images
+└── raw_data/            # reads and Step 3–5 results (created locally, NOT on GitHub)
+    ├── fastqc_results/
+    ├── trimmed_reads/
+    ├── star_index/
+    └── star_align/
+```
+
+`raw_data/` is excluded from GitHub (see [`.gitignore`](.gitignore)) because the reads and alignments are several GB. Only an empty placeholder (`raw_data/.gitkeep`) is kept, so the folder exists after cloning. The scripts recreate everything in it.
+
+**Run every command from the `training/` folder.** Each script works out where `training/` is from its own location, so the folder can be anywhere on your computer.
+
+---
+
+## Setup
+
+### 1. Get the material
+
+```bash
+git clone https://github.com/<your-username>/<repo-name>.git training
+cd training
+mkdir -p raw_data   # only needed if the folder is missing
+```
+
+### 2. Install the command-line tools
+
+```bash
+sudo apt update
+sudo apt install fastqc cutadapt trim-galore rna-star multiqc
+```
+
+If `multiqc` is not available through `apt`, install it with `pip install multiqc`. Check that the tools work:
+
+```bash
+fastqc --version && cutadapt --version && trim_galore --version && STAR --version && multiqc --version
+```
+
+### 3. Install the R packages
+
+In R or RStudio:
+
+```r
+install.packages(c("tidyverse", "BiocManager", "pheatmap"))
+BiocManager::install(c("rtracklayer", "DESeq2", "EnhancedVolcano"))
+```
+
+### 4. Set your folder in the R scripts
+
+The two R scripts start with this line. Change it to wherever your `training/` folder is:
+
+```r
+training_dir <- path.expand("~/Desktop/bioinformatics_workshop/training")
+```
+
+### 5. Match the number of CPU cores (optional)
+
+The scripts use 4 threads for FastQC and Trim Galore and 8 for STAR (`THREADS=8` at the top of `ecoli_gene_quantification.sh`). Check how many cores you have with `nproc`, and lower these numbers if you have fewer.
+
+---
+
+## Quick start
+
+To run the whole analysis in one go:
+
+```bash
+bash scripts/download_fastq.sh
+bash scripts/get_reference.sh
+bash scripts/fast_qc.sh
+bash scripts/trim.sh
+bash scripts/ecoli_gene_quantification.sh
+Rscript scripts/merge_data.R
+Rscript scripts/DEG_ecoli.R
+```
+
+In the workshop, run the steps one at a time and look at the output of each one before moving on.
+
+> **Tip:** The download and alignment steps take a while. Run them inside `screen` or `tmux`, or with `nohup`, so they keep going if the terminal closes:
+> `nohup bash scripts/download_fastq.sh > download.log 2>&1 &`
+
+---
+
+## Step 1 – Download the reads
+
+```bash
+bash scripts/download_fastq.sh
+```
+
+The script downloads the 32 FASTQ files from ENA into `raw_data/`. It:
+
+- **resumes** files that were only partly downloaded (`wget -c`), so it is safe to run again;
+- skips files that are already complete;
+- **checks** every file with `gzip -t` at the end.
+
+The last lines of the output tell you whether everything worked:
+
+```text
+FASTQ files present: 32 of 32
+All files passed the check.
+```
+
+If a file is reported as `BROKEN`, delete it and run the script again.
+
+If you started the download with `nohup`, follow it with:
+
+```bash
+tail download.log                       # latest progress
+ls raw_data/*.fastq.gz | wc -l          # should reach 32
+```
+
+### Sample information (`DEG/pdata.csv`)
+
+`DEG/pdata.csv` is already in the repository. It tells R which sample is wild type and which is mutant. To make it yourself:
+
+1. Open <https://www.ebi.ac.uk/ena/browser/view/PRJNA714667>.
+2. In **Show Column Selection**, tick **run_accession**, **experiment_accession** and **sample_title**.
+3. Click **TSV** to download the table. It is tab-separated, so convert it to comma-separated:
+
+```bash
+tr '\t' ',' < ~/Downloads/filereport_read_run_PRJNA714667_tsv.txt > DEG/pdata.csv
+```
+
+It needs a **`run_accession`** column (the SRR IDs) and a **`sample_title`** column containing `ECWT` or `ECMS`.
+
+---
+
+## Step 2 – Reference genome
+
+```bash
+bash scripts/get_reference.sh
+```
+
+The reference is *E. coli* K-12 MG1655, assembly ASM584v2 ([NCBI page](https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000005845.2/)). The script downloads and unzips two files into `reference/`, and skips the download if they are already there:
+
+| File | Content |
+|---|---|
+| `GCF_000005845.2_ASM584v2_genomic.fna` | Genome sequence (FASTA) |
+| `genomic.gtf` | Gene annotation: where each gene is |
+
+---
+
+## Step 3 – Quality control
+
+```bash
+bash scripts/fast_qc.sh
+```
+
+**FastQC** writes a quality report for every FASTQ file into `raw_data/fastqc_results/`. **MultiQC** combines them into one page, `raw_data/fastqc_results/multiqc_report/multiqc_report.html`. Open it in a web browser.
+
+| FastQC section | What a good result looks like |
+|---|---|
+| Per base sequence quality | Most bases above Phred 30. A drop at the ends of reads means trimming is needed. |
+| Per sequence quality scores | Most reads have a high average quality. |
+| Per base sequence content | Some bias in the first few bases is normal; it should even out after trimming. |
+| Adapter content | No adapters. If adapters are present, they must be removed before alignment. |
+| Per sequence GC content | One peak near the GC content of *E. coli* (about 51 %). Extra peaks can mean contamination. |
+| Sequence duplication levels | Low to moderate. High duplication can mean PCR bias or over-sequencing. |
+
+---
+
+## Step 4 – Trimming
+
+```bash
+bash scripts/trim.sh
+```
+
+**Trim Galore** removes adapters and low-quality bases from the ends of the reads. With the settings used here it also:
+
+- keeps the two reads of each pair together (`--paired`);
+- discards pairs where a read is shorter than 36 bases after trimming (`--length 36`);
+- runs FastQC on the trimmed reads (`--fastqc`), so you can compare before and after.
+
+Samples whose FASTQ files are missing are skipped with a message, so finish Step 1 first.
+
+For each sample, `raw_data/trimmed_reads/` gets:
+
+| File | Content |
+|---|---|
+| `<sample>_1_val_1.fq.gz`, `<sample>_2_val_2.fq.gz` | Trimmed reads (used in Step 5) |
+| `*_trimming_report.txt` | How many adapters and bases were removed |
+| `*_val_*_fastqc.html` | FastQC report of the trimmed reads |
+
+---
+
+## Step 5 – Indexing, alignment and gene counting
+
+```bash
+bash scripts/ecoli_gene_quantification.sh
+```
+
+**Indexing.** An aligner cannot compare every read with the whole genome base by base; that would be far too slow. STAR first builds an **index** of the genome, which lets it find where each read belongs very quickly. The index is built once into `raw_data/star_index/` and reused for every sample; if it already exists, the script skips this step.
+
+**Alignment and counting.** STAR then aligns each pair of trimmed reads. With `--quantMode GeneCounts` it also uses the GTF to count how many reads fall on each gene, so alignment and counting happen in one step.
+
+| Option | Meaning |
+|---|---|
+| `--runThreadN 8` | Number of CPU cores (set by `THREADS` at the top of the script). |
+| `--sjdbOverhang 149` | Read length minus 1 (the reads are 150 bases). |
+| `--genomeSAindexNbases 10` | Needed for small genomes like *E. coli*. Without it, STAR can run out of memory or crash. |
+| `--readFilesCommand zcat` | Lets STAR read the compressed `.fq.gz` files directly. |
+| `--outSAMtype BAM SortedByCoordinate` | Writes a sorted BAM file. |
+| `--quantMode GeneCounts` | Writes the gene counts (`ReadsPerGene.out.tab`). |
+
+Each sample gets these files in `raw_data/star_align/`:
+
+| File | Content |
+|---|---|
+| `<sample>_Aligned.sortedByCoord.out.bam` | Aligned reads |
+| `<sample>_ReadsPerGene.out.tab` | Reads counted per gene (used in Step 6) |
+| `<sample>_Log.final.out` | Mapping summary |
+
+At the end, the script prints the mapping rate of every sample (the `Uniquely mapped reads %` line of each `Log.final.out`). The paper reports about **79–85 %** of reads mapped.
+
+### Understanding `ReadsPerGene.out.tab`
+
+Each `ReadsPerGene.out.tab` file has four columns:
+
+| Column | Content | Use it when the library is… |
+|---|---|---|
+| 1 | Gene ID (for example `b0204`) | — |
+| 2 | Counts ignoring strand | unstranded |
+| 3 | Counts for reads on the same strand as the gene | forward-stranded |
+| 4 | Counts for reads on the opposite strand to the gene | reverse-stranded |
+
+The first four rows (`N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`) are summary numbers, not genes.
+
+<p align="center">
+  <img src="Document/images/readspergene_example.png" width="380" alt="First rows of a ReadsPerGene.out.tab file">
+  <br><em>The first rows of a ReadsPerGene.out.tab file from this dataset.</em>
+</p>
+
+**Which column to use?** Compare columns 3 and 4: if they are similar, the library is unstranded (column 2). If column 3 is much larger, it is forward-stranded (column 3). If column 4 is much larger, it is reverse-stranded (column 4).
+
+> **In this dataset, use column 4.** Column 3 is close to zero and column 4 is almost equal to column 2 (gene `b0204`: 50188, 33, 50158). The library is **reverse-stranded**.
+
+Check a whole file at once:
+
+```bash
+tail -n +5 raw_data/star_align/SRR13970433_ReadsPerGene.out.tab | \
+  awk '{c2+=$2; c3+=$3; c4+=$4} END {print "col2:", c2, " col3:", c3, " col4:", c4}'
+```
+
+---
+
+## Step 6 – Merge the gene counts
+
+```bash
+Rscript scripts/merge_data.R
+```
+
+STAR writes one count file per sample. [`merge_data.R`](scripts/merge_data.R):
+
+1. reads all `ReadsPerGene.out.tab` files and prints how many it found (should be **16**);
+2. drops the 4 summary rows and keeps the count column set by `count_col` (**4** for this dataset);
+3. merges the samples into one table, with genes as rows and samples as columns;
+4. adds gene names from the GTF (genes without a name keep their ID);
+5. saves `DEG/merged_gene_counts.csv` (gene IDs) and `DEG/merged_counts_annotated.csv` (gene names).
+
+---
+
+## Step 7 – Differential expression
+
+```bash
+Rscript scripts/DEG_ecoli.R
+```
+
+The script first matches the samples in the count table to `DEG/pdata.csv` and prints how many samples are in each group (should be **8 and 8**). It then removes genes with very few reads (genes are kept only if at least 3 samples have 10 or more reads) and runs **DESeq2**, which tests every gene for a difference between wild type and mutant. DESeq2:
+
+1. **normalises** the counts, so deeply sequenced samples don't look as if they have higher expression;
+2. **estimates the variability** of each gene between replicates;
+3. **tests** each gene for a difference between the groups;
+4. **corrects** the p-values for testing thousands of genes at once. The corrected value is `padj`.
+
+The wild type (ECWT) is the reference group, so the results describe the mutant compared with wild type.
+
+### Outputs (in `DEG/`)
+
+| File | Content |
+|---|---|
+| `DESeq2_results.csv` | All genes, sorted by adjusted p-value |
+| `DESeq2_significant.csv` | Genes with `padj < 0.05` and \|log2FC\| ≥ 1 |
+| `volcano_plot.png` | Volcano plot |
+| `heatmap_top50.png` | Heatmap of the 50 most significant genes |
+| `PCA_plot.png`, `PCA_data.csv` | PCA of the samples |
+
+The script also prints the number of significant genes, split into up and down in ECMS.
+
+### Reading the results table
+
+| Column | Meaning |
+|---|---|
+| `baseMean` | Average normalised count across all samples |
+| `log2FoldChange` | Change in the mutant compared with wild type. **Positive = higher in ECMS; negative = lower in ECMS.** A value of 1 means a 2-fold change. |
+| `lfcSE` | Standard error of the log2 fold change |
+| `stat` | Test statistic |
+| `pvalue` | Raw p-value |
+| `padj` | Adjusted p-value. **Use this one** to call significance (usually `padj < 0.05`). |
+
+### Reading the plots
+
+| Plot | What it shows | What to look for |
+|---|---|---|
+| PCA | Overall similarity between samples (counts after a variance-stabilising transformation) | The two strains form two separate groups. A sample sitting with the wrong group may be mislabelled or a failed library. |
+| Volcano | Fold change (x) against significance (y) for every gene | Genes far left or right **and** high up have large, significant changes. Coloured genes pass both cut-offs (`padj < 0.05`, \|log2FC\| ≥ 1). |
+| Heatmap | Expression of the top 50 genes in every sample, scaled per gene | Clear blocks of high and low expression that separate ECWT from ECMS. |
+
+---
+
+## Questions
+
+1. How many genes are significantly up and down in the *slyA* mutant?
+2. Do the samples separate by strain on PC1 of the PCA plot? How much variance does PC1 explain?
+3. In `DEG_ecoli.R`, change the contrast to `c("group", "ECWT", "ECMS")`. What happens to the sign of `log2FoldChange`? Does the number of significant genes change?
+4. Rerun Step 6 with `count_col <- 2` (unstranded), then Step 7. How do the results change?
+5. Look up the top five genes on [EcoCyc](https://ecocyc.org/). Are any of them known SlyA targets?
+
+---
+
+## Troubleshooting
+
+| Problem | Likely cause | Fix |
+|---|---|---|
+| Download stops or a file is reported BROKEN | Network interruption or terminal closed | Delete the broken file, rerun `download_fastq.sh` (inside `screen` or with `nohup`) |
+| `Cannot find .../raw_data` | `raw_data/` missing, or script not inside `training/scripts/` | Run `mkdir -p raw_data` from `training/`; keep the scripts in `scripts/` |
+| STAR: cannot open the FASTA or GTF | Reference missing or still compressed | Run `bash scripts/get_reference.sh` |
+| STAR crashes or runs out of memory while indexing | Index too large for a small genome, or a half-built index | Keep `--genomeSAindexNbases 10`; delete `raw_data/star_index/` and rerun |
+| STAR is very slow or the computer freezes | More threads than CPU cores | Lower `THREADS` in `ecoli_gene_quantification.sh` (check cores with `nproc`) |
+| `ls: cannot access '*_1_val_1.fq.gz'` | Trimming not finished | Rerun Step 4 and check `raw_data/trimmed_reads/` |
+| R: `Count files found: 0` | Wrong `training_dir`, or STAR not finished | Fix the path at the top of the R script; check `raw_data/star_align/` |
+| Very few reads counted per gene | Wrong count column | Use `count_col <- 4` for this dataset |
+| DESeq2: `stopifnot(...) are not all TRUE` | SRR IDs in `pdata.csv` don't match the count columns, or `pdata.csv` is still tab-separated | Compare `colnames(counts)` with `pdata$run_accession`; convert the file as in Step 1 |
+| DESeq2: `model matrix is not full rank` | All samples ended up in one group | Check `table(pdata$group)` and the `sample_title` column |
+| `could not find function "EnhancedVolcano"` | Package not installed | `BiocManager::install("EnhancedVolcano")` |
+
+---
+
+## Data source
+
+The data used in this training are publicly available:
+
+- NCBI GEO: [GSE168963](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE168963)
+- ENA / SRA BioProject: [PRJNA714667](https://www.ebi.ac.uk/ena/browser/view/PRJNA714667)
+- Reference genome: *E. coli* K-12 MG1655, [GCF_000005845.2 (ASM584v2)](https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000005845.2/)
+
+The data set is described in *"Transcriptome RNA Sequencing Data Set of Differential Gene Expression in Escherichia coli BW25113 SlyA Wild Type and Mutant Strains"* (see `Document/`). Please cite the original publication if you use these data.
